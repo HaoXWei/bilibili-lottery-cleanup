@@ -170,40 +170,58 @@ async def check_and_wait_captcha(ws):
 # 滚动与页面加载控制（小步温和推进，杜绝触发人机判断，支持持续执行）
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def load_next_batch_scroll(ws, steps=4, base_delay=2.0):
+async def load_next_batch_scroll(ws, steps=4, base_delay=2.0, max_no_change=4):
     """
     温和向下滑动推进页面，加载下一批历史动态。
     特点：
     - 采用小步长平滑滚动 (1000~1400px)，配合随机微扰动，杜绝机械特征
-    - 严格检测是否真正触及动态历史最底部 (出现 .bili-dyn-list__no-more)
-    - 达到步数或加载到新动态后即时返回，交由主流程清理，实现流式持续处理
+    - 双重触底判定：
+      1. 检测是否出现「你已经到达世界的尽头」或 .bili-dyn-list-no-more
+      2. 连续 4 轮滚动页面动态条数无变化时自动停止，避免死循环
+    - 达到步数或加载到新批次后即时返回，交由主流程清理，实现流式持续处理
     返回值: is_true_bottom (bool)
     """
-    print(f"📜 正在向下滑动加载下一批动态 (平滑推进 {steps} 步，模拟真人浏览)...")
-    
-    start_info = await cdp_eval(ws, """(() => {
+    print(f"📜 正在向下滑动加载下一批动态 (平滑推进至多 {steps} 步，模拟真人浏览)...")
+
+    check_bottom_js = """(() => {
         const items = document.querySelectorAll('.bili-dyn-list__item');
-        const noMore = !!document.querySelector('.bili-dyn-list__no-more');
-        return { count: items.length, noMore: noMore };
-    })()""")
+        const noMoreEl = document.querySelector('.bili-dyn-list-no-more, .bili-dyn-list__no-more');
+        const bodyText = document.body ? document.body.innerText : '';
+        const hasEndText = bodyText.includes('你已经到达世界的尽头') || 
+                           bodyText.includes('到达世界的尽头') || 
+                           bodyText.includes('没有更多动态了') ||
+                           bodyText.includes('好像没有东西诶');
+        const noMore = !!noMoreEl || hasEndText;
+        const atBottom = (window.innerHeight + window.scrollY) >= (document.documentElement.scrollHeight - 350);
+        return { count: items.length, noMore: noMore, atBottom: atBottom, scrollHeight: document.documentElement.scrollHeight };
+    })()"""
+
+    start_info = await cdp_eval(ws, check_bottom_js)
     
     if start_info and start_info.get('noMore'):
-        print("🏁 页面已显示「没有更多动态了」，已达历史最底部。")
+        print("🏁 页面已显示「你已经到达世界的尽头」，已达历史最底端。")
         return True
 
     start_count = start_info.get('count', 0) if start_info else 0
+    prev_count = start_count
+    no_change_rounds = 0
 
     for step in range(1, steps + 1):
         await check_and_wait_captcha(ws)
         scroll_step = random.randint(1000, 1400)
-        
+
         state = await cdp_eval(ws, f"""(() => {{
             window.scrollBy({{ top: {scroll_step}, behavior: 'smooth' }});
-            // 派发 scroll 事件确保 B 站 IntersectionObserver / 滚动监听器正常响应
             window.dispatchEvent(new Event('scroll'));
             const items = document.querySelectorAll('.bili-dyn-list__item');
-            const noMore = !!document.querySelector('.bili-dyn-list__no-more');
-            const atBottom = (window.innerHeight + window.scrollY) >= (document.documentElement.scrollHeight - 300);
+            const noMoreEl = document.querySelector('.bili-dyn-list-no-more, .bili-dyn-list__no-more');
+            const bodyText = document.body ? document.body.innerText : '';
+            const hasEndText = bodyText.includes('你已经到达世界的尽头') || 
+                               bodyText.includes('到达世界的尽头') || 
+                               bodyText.includes('没有更多动态了') ||
+                               bodyText.includes('好像没有东西诶');
+            const noMore = !!noMoreEl || hasEndText;
+            const atBottom = (window.innerHeight + window.scrollY) >= (document.documentElement.scrollHeight - 350);
             return {{ count: items.length, noMore: noMore, atBottom: atBottom }};
         }})()""")
 
@@ -211,43 +229,43 @@ async def load_next_batch_scroll(ws, steps=4, base_delay=2.0):
         no_more = state.get('noMore', False) if state else False
 
         if no_more:
-            print("🏁 检测到「没有更多动态了」，已达历史最底端。")
+            print("🏁 检测到「你已经到达世界的尽头」，已达历史最底端。")
             return True
 
-        # 若已经加载了较多新动态（超过 15 条），则提前结束本次滚动，进入清理阶段
-        if count >= start_count + 15:
-            print(f"   [推进中] 已成功加载新批次动态 (当前共 {count} 条)")
-            break
+        if count > prev_count:
+            no_change_rounds = 0
+            prev_count = count
+            if count >= start_count + 15:
+                print(f"   [推进中] 已成功加载新批次动态 (当前共 {count} 条)")
+                break
+        else:
+            no_change_rounds += 1
+            if no_change_rounds >= max_no_change:
+                print(f"🏁 连续 {no_change_rounds} 步滚动页面均无新动态加载，判定已达历史底端。")
+                return True
 
-        # 人性化随机间隔
+        # 人性化随机微扰间隔
         jitter = random.uniform(0.2, 0.6)
         await asyncio.sleep(base_delay + jitter)
 
     # 再次检查是否到达底部或需要轻微抖动触发加载
-    final_state = await cdp_eval(ws, """(() => {
-        const items = document.querySelectorAll('.bili-dyn-list__item');
-        const noMore = !!document.querySelector('.bili-dyn-list__no-more');
-        const atBottom = (window.innerHeight + window.scrollY) >= (document.documentElement.scrollHeight - 300);
-        return { count: items.length, noMore: noMore, atBottom: atBottom };
-    })()""")
+    final_state = await cdp_eval(ws, check_bottom_js)
 
     if final_state and final_state.get('noMore'):
+        print("🏁 检测到「你已经到达世界的尽头」，已达历史最底端。")
         return True
 
-    # 如果已经滚到了当前可视区底部但未出现新动态，尝试轻微上下回弹触发 B 站请求
+    # 如果已经在底部但未出现新动态，尝试轻微回弹触发 B 站请求
     if final_state and final_state.get('atBottom') and final_state.get('count') == start_count:
-        print("   ⏳ 正在等待 B 站服务端返回历史数据...")
+        print("   ⏳ 接近可视底端，轻微回弹等待 B 站服务端响应...")
         await cdp_eval(ws, "window.scrollBy({ top: -200, behavior: 'smooth' });")
         await asyncio.sleep(1.0)
         await cdp_eval(ws, "window.scrollBy({ top: 300, behavior: 'smooth' });")
         await asyncio.sleep(2.5)
         
-        post_nudge = await cdp_eval(ws, """(() => {
-            const items = document.querySelectorAll('.bili-dyn-list__item');
-            const noMore = !!document.querySelector('.bili-dyn-list__no-more');
-            return { count: items.length, noMore: noMore };
-        })()""")
-        if post_nudge and post_nudge.get('noMore'):
+        post_nudge = await cdp_eval(ws, check_bottom_js)
+        if post_nudge and (post_nudge.get('noMore') or post_nudge.get('count') == start_count):
+            print("🏁 服务端已无更多数据返回，已到达历史动态尽头。")
             return True
 
     return False
@@ -632,6 +650,14 @@ async def run(args):
                         processed_dyn_ids.add(dyn_id)
 
             print(f"📋 第 {pass_no} 轮识别完成：待清理过期动态: {len(candidates_del)} 条")
+
+            # 触底或无新动态终止判定
+            if is_bottom or (len(new_items) == 0 and len(candidates_del) == 0):
+                if len(new_items) == 0 and len(candidates_del) == 0:
+                    print("🏁 页面已无待分析的新动态，且未扫描到待清理内容，已全部处理完毕。")
+                else:
+                    print("\n🎉 全部历史动态已扫描完毕，已成功触达个人动态最底端！")
+                break
 
             # 5. 如果是 --scan 预览模式
             if args.scan:
